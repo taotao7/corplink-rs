@@ -1,3 +1,106 @@
+diff --git a/libwg/socks5.go b/libwg/socks5.go
+index a88a5e2..3dd0bf5 100644
+--- a/libwg/socks5.go
++++ b/libwg/socks5.go
+@@ -9,19 +9,44 @@ package main
+ import (
+ 	"context"
+ 	"net"
++	"sync"
++	"time"
+ 
+ 	socks5 "github.com/things-go/go-socks5"
+ 	"golang.zx2c4.com/wireguard/device"
+ 	"golang.zx2c4.com/wireguard/tun/netstack"
+ )
+ 
++// dnsCacheTTL is how long a successful resolution is reused. On a lossy
++// WireGuard-over-TCP link a DNS round-trip is expensive and often lost, and
++// browsers open many parallel connections to the same host. Caching the result
++// turns N lookups per page into 1.
++const dnsCacheTTL = 5 * time.Minute
++
++// dnsLookupRetries is how many times to retry a failed/timed-out lookup before
++// giving up. A single UDP/TCP DNS attempt is frequently dropped on a lossy
++// link; retrying a few times makes resolution reliable at the cost of latency.
++const dnsLookupRetries = 4
++
++type dnsCacheEntry struct {
++	ip      net.IP
++	expires time.Time
++}
++
+ // netstackResolver resolves hostnames inside the tunnel via the netstack DNS,
+ // so SOCKS5 requests for internal names work without touching the host resolver.
++// Results are cached and lookups retried to survive lossy links.
+ type netstackResolver struct {
+-	tnet *netstack.Net
++	tnet  *netstack.Net
++	mu    sync.Mutex
++	cache map[string]dnsCacheEntry
++}
++
++func newNetstackResolver(tnet *netstack.Net) *netstackResolver {
++	return &netstackResolver{tnet: tnet, cache: make(map[string]dnsCacheEntry)}
+ }
+ 
+-func (r netstackResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
++func (r *netstackResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+ 	// Literal IPs need no DNS lookup. This also covers the 0.0.0.0 placeholder
+ 	// that clients send as the source address in a UDP ASSOCIATE request.
+ 	if ip := net.ParseIP(name); ip != nil {
+@@ -33,16 +58,35 @@ func (r netstackResolver) Resolve(ctx context.Context, name string) (context.Con
+ 	if name == "" || name == "0" {
+ 		return ctx, net.IPv4zero, nil
+ 	}
+-	addrs, err := r.tnet.LookupHost(name)
+-	if err != nil {
+-		return ctx, nil, err
++
++	// Serve from cache when fresh.
++	r.mu.Lock()
++	if e, ok := r.cache[name]; ok && time.Now().Before(e.expires) {
++		ip := e.ip
++		r.mu.Unlock()
++		return ctx, ip, nil
+ 	}
+-	for _, a := range addrs {
+-		if ip := net.ParseIP(a); ip != nil {
+-			return ctx, ip, nil
++	r.mu.Unlock()
++
++	// Retry the lookup; lossy links drop individual DNS round-trips.
++	var lastErr error
++	for attempt := 0; attempt < dnsLookupRetries; attempt++ {
++		addrs, err := r.tnet.LookupHost(name)
++		if err != nil {
++			lastErr = err
++			continue
++		}
++		for _, a := range addrs {
++			if ip := net.ParseIP(a); ip != nil {
++				r.mu.Lock()
++				r.cache[name] = dnsCacheEntry{ip: ip, expires: time.Now().Add(dnsCacheTTL)}
++				r.mu.Unlock()
++				return ctx, ip, nil
++			}
+ 		}
++		lastErr = &net.DNSError{Err: "no addresses found", Name: name}
+ 	}
+-	return ctx, nil, &net.DNSError{Err: "no addresses found", Name: name}
++	return ctx, nil, lastErr
+ }
+ 
+ // socksLogger adapts device.Logger to the go-socks5 Logger interface.
+@@ -64,7 +108,7 @@ func startSocks5(listen, username, password string, tnet *netstack.Net, logger *
+ 	}
+ 
+ 	opts := []socks5.Option{
+-		socks5.WithResolver(netstackResolver{tnet: tnet}),
++		socks5.WithResolver(newNetstackResolver(tnet)),
+ 		socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
+ 			return tnet.DialContext(ctx, network, addr)
+ 		}),
 diff --git a/tun/netstack/tun.go b/tun/netstack/tun.go
 index a7aec9e..f8bf99b 100644
 --- a/tun/netstack/tun.go
