@@ -95,6 +95,12 @@ pub struct Config {
     /// head-of-line blocking), forcing "udp" can be far faster there. Leave unset to keep the
     /// default (follow server `protocol_mode`: 1 => tcp, otherwise udp).
     pub force_protocol: Option<String>,
+    /// Override the WireGuard interface MTU instead of using the server-advertised
+    /// `vpn_mtu` (typically 1400). On a lossy WireGuard-over-TCP path, a smaller MTU
+    /// (e.g. 1280) reduces per-segment retransmit cost and avoids PMTU black-holing,
+    /// which can noticeably improve throughput/stability. Leave unset to follow the
+    /// server value.
+    pub mtu: Option<u32>,
 }
 
 impl fmt::Display for Config {

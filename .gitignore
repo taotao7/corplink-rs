@@ -21,3 +21,6 @@ libwg/libwg.h
 # release artifacts
 /release/
 *.zip
+
+# runtime log
+corplink.log

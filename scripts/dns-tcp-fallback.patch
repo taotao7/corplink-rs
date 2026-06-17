@@ -1,0 +1,18 @@
+diff --git a/tun/netstack/tun.go b/tun/netstack/tun.go
+index a7aec9e..f8bf99b 100644
+--- a/tun/netstack/tun.go
++++ b/tun/netstack/tun.go
+@@ -692,6 +692,13 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
+ 			} else if err == context.DeadlineExceeded {
+ 				err = errTimeout
+ 			}
++			// On a lossy WireGuard-over-TCP link, the UDP DNS datagram is often
++			// dropped with no retransmit, so the UDP attempt times out. Fall
++			// through to the TCP attempt (which retransmits) instead of giving
++			// up. Only surface the error on the final (TCP) attempt.
++			if useUDP {
++				continue
++			}
+ 			return dnsmessage.Parser{}, dnsmessage.Header{}, err
+ 		}
+ 		if err := p.SkipQuestion(); err != dnsmessage.ErrSectionDone {

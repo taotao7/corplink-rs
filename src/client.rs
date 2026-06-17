@@ -847,8 +847,14 @@ impl Client {
             .into_iter()
             .filter(|vpn| {
                 if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
+                    // Match on `name` or `en_name`: some servers populate only
+                    // `name` (e.g. "ali-risk") and leave `en_name` empty, so
+                    // filtering on `en_name` alone would skip every node.
+                    if vpn.name != server_name && vpn.en_name != server_name {
+                        log::info!(
+                            "skip {} ({}), expect {}",
+                            vpn.name, vpn.en_name, server_name
+                        );
                         return false;
                     }
                 }
@@ -899,7 +905,13 @@ impl Client {
             .clone();
         log::info!("try to get wg conf from remote");
         let wg_info = self.fetch_peer_info(&key).await?;
-        let mtu = wg_info.setting.vpn_mtu;
+        let mtu = match self.conf.mtu {
+            Some(m) => {
+                log::info!("overriding server mtu {} with configured mtu {}", wg_info.setting.vpn_mtu, m);
+                m
+            }
+            None => wg_info.setting.vpn_mtu,
+        };
         let dns = wg_info.setting.vpn_dns;
         let peer_key = wg_info.public_key;
         let public_key = self
@@ -1015,6 +1027,35 @@ impl Client {
                 );
             }
         }
+
+        // Ensure the VPN-provided DNS server is reachable through the tunnel.
+        // Hostname resolution (both intranet and, in netstack/socks5 mode, all
+        // proxied traffic) is done by sending queries to this DNS server via the
+        // tunnel. If its IP isn't covered by allowed_ips — which happens in split
+        // mode, and in "full" modes where the server only advertises intranet
+        // CIDRs — every lookup is dropped and times out ("failed to resolve ...
+        // i/o timeout"). Add it as a /32 (or /128) so DNS always routes inside.
+        if !dns.is_empty() {
+            for dns_ip in dns.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                match dns_ip.parse::<std::net::IpAddr>() {
+                    Ok(ip) => {
+                        let cidr = match ip {
+                            std::net::IpAddr::V4(_) => format!("{dns_ip}/32"),
+                            std::net::IpAddr::V6(_) => format!("{dns_ip}/128"),
+                        };
+                        let already = allowed_ips.iter().any(|a| {
+                            crate::utils::subtract_cidr_from_cidr(&cidr, a).is_empty()
+                        });
+                        if !already {
+                            log::info!("adding vpn dns {cidr} to allowed_ips so lookups route through the tunnel");
+                            allowed_ips.push(cidr);
+                        }
+                    }
+                    Err(e) => log::warn!("could not parse vpn dns {dns_ip:?} as IP: {e}"),
+                }
+            }
+        }
+
         log::info!(
             "final allowed_ips ({} entries): {:?}",
             allowed_ips.len(),
